@@ -1,74 +1,40 @@
-# Course Catalog API
+# Course Registration API — Phase 3
 
-FastAPI project for Phase 1: Environment Setup & Catalog Ingestion.
+## Local run
 
-## Install
-
-```bash
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Mac/Linux
-source venv/bin/activate
-pip install -r requirements.txt
+```powershell
+py -m pip install -r requirements.txt
+py -m uvicorn main:app --reload
 ```
 
-## Run locally
+## Local manual test
 
-```bash
-uvicorn main:app --reload
+```powershell
+curl.exe -X POST -F "file=@sample_catalog.html;type=text/html" http://127.0.0.1:8000/api/v1/admin/catalog/import
+curl.exe -X POST -F "file=@student-example.html;type=text/html" http://127.0.0.1:8000/api/v1/students/770001/history/import
+curl.exe -X POST http://127.0.0.1:8000/api/v1/students/770001/plan -H "Content-Type: application/json" -d "{\"planned_courses\":[{\"course_code\":\"COSC-4426\",\"term\":\"26F\"},{\"course_code\":\"ITEC-3506\",\"term\":\"26F\"},{\"course_code\":\"COSC-2406\",\"term\":\"26F\"}]}"
+curl.exe http://127.0.0.1:8000/api/v1/students/770001/audit-report
+curl.exe "http://127.0.0.1:8000/api/v1/students/770001/audit-report?strict=true"
 ```
 
-## Test locally
+## Render
 
-Import the HTML catalog:
-
-```bash
-curl -X POST -F "file=@sample_catalog.html;type=text/html" http://localhost:8000/api/v1/admin/catalog/import
-```
-
-Get a course without a space:
-
-```bash
-curl http://localhost:8000/api/v1/catalog/courses/COSC3506
-```
-
-Get a course with encoded space:
-
-```bash
-curl http://localhost:8000/api/v1/catalog/courses/COSC%203506
-```
-
-Expected JSON keys:
-
-```json
-{
-  "course_code": "COSC 3506",
-  "title": "Software Systems Development",
-  "credits": 3,
-  "prerequisites": "COSC 2007",
-  "cross_listed": "ITEC 3506"
-}
-```
-
-## Render deployment
-
-Build Command:
+Build command:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Start Command:
+Start command:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-After deployment, replace the placeholder in `api_url.txt` with your Render base URL only, for example:
+## Phase 3 submission
 
-```text
-https://sylviayi.onrender.com
-```
+Upload these files individually to VPL:
 
-Do not include a trailing slash or endpoint path.
+- `api_url.txt`
+- `ci_proof.png` — screenshot of a green GitHub Actions run
+- `ci_logs.txt` — copied text of the green GitHub Actions run logs
