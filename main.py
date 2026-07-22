@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import os
 import re
+import time
+from collections import defaultdict, deque
 from typing import Any
 
+import bcrypt
+import jwt
+
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Course Registration API", version="3.0")
+app = FastAPI(title="Course Registration API", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +38,15 @@ students: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
 VALID_STATUSES = {"completed", "in-progress", "attempted"}
 GRADUATION_TARGET = 120
+JWT_SECRET = os.getenv("JWT_SECRET", "phase4-course-registration-secret")
+JWT_ALGORITHM = "HS256"
+JWT_TTL_SECONDS = 3600
+RATE_LIMIT = 10
+RATE_WINDOW_SECONDS = 60
+
+users: dict[str, dict[str, str]] = {}
+rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 class HistoryPayload(BaseModel):
@@ -31,6 +55,78 @@ class HistoryPayload(BaseModel):
 
 class PlanPayload(BaseModel):
     planned_courses: list[dict[str, Any]]
+
+
+class CredentialsPayload(BaseModel):
+    username: str
+    password: str
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"), password_hash.encode("utf-8")
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def create_access_token(username: str, role: str) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": username,
+        "role": role,
+        "iat": now,
+        "exp": now + JWT_TTL_SECONDS,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Unauthorized") from exc
+    if not payload.get("sub") or not payload.get("role"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return payload
+
+
+def authenticated_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict[str, Any]:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return decode_access_token(credentials.credentials)
+
+
+def optional_authenticated_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict[str, Any] | None:
+    if credentials is None:
+        return None
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return decode_access_token(credentials.credentials)
+
+
+def require_owner(student_id: str, identity: dict[str, Any]) -> None:
+    if str(identity.get("sub")) != student_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_owner_or_admin(student_id: str, identity: dict[str, Any]) -> None:
+    if identity.get("role") == "admin":
+        return
+    require_owner(student_id, identity)
+
+
+# The assignment requires a built-in admin/admin account.
+users["admin"] = {"password_hash": hash_password("admin"), "role": "admin"}
 
 
 def clean_text(value: Any) -> str:
@@ -247,6 +343,32 @@ def root() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/v1/auth/register", status_code=201)
+def register(payload: CredentialsPayload) -> dict[str, str]:
+    username = clean_text(payload.username)
+    if not username or not payload.password:
+        raise HTTPException(status_code=400, detail="Username and password are required")
+    if username in users:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    users[username] = {
+        "password_hash": hash_password(payload.password),
+        "role": "student",
+    }
+    return {"status": "registered"}
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: CredentialsPayload) -> dict[str, str]:
+    username = clean_text(payload.username)
+    user = users.get(username)
+    if user is None or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {
+        "access_token": create_access_token(username, user["role"]),
+        "token_type": "bearer",
+    }
+
+
 @app.post("/api/v1/admin/catalog/import")
 async def import_catalog(file: UploadFile = File(...)) -> dict[str, Any]:
     content = await file.read()
@@ -273,8 +395,11 @@ def get_course(course_code: str) -> dict[str, Any]:
 
 @app.post("/api/v1/students/{student_id}/history/import", status_code=201)
 async def import_history(
-    student_id: str, file: UploadFile = File(...)
+    student_id: str,
+    file: UploadFile = File(...),
+    identity: dict[str, Any] = Depends(authenticated_user),
 ) -> dict[str, Any]:
+    require_owner(student_id, identity)
     content = await file.read()
     history = parse_transcript_html(content.decode("utf-8", errors="replace"))
     old_plan = students.get(student_id, {}).get("plan", [])
@@ -303,6 +428,15 @@ def create_plan(student_id: str, payload: PlanPayload) -> dict[str, Any]:
     return {"status": "success", "planned_courses_saved": len(payload.planned_courses)}
 
 
+@app.get("/api/v1/students/{student_id}/plan")
+def get_plan(
+    student_id: str, identity: dict[str, Any] = Depends(authenticated_user)
+) -> dict[str, Any]:
+    require_owner_or_admin(student_id, identity)
+    student = require_student(student_id)
+    return {"student_id": student_id, "plan": student["plan"]}
+
+
 @app.put("/api/v1/students/{student_id}/plan")
 def update_plan(student_id: str, payload: PlanPayload) -> dict[str, Any]:
     student = require_student(student_id)
@@ -318,7 +452,10 @@ def delete_plan(student_id: str) -> dict[str, str]:
 
 
 @app.get("/api/v1/students/{student_id}/profile")
-def get_profile(student_id: str) -> dict[str, Any]:
+def get_profile(
+    student_id: str, identity: dict[str, Any] = Depends(authenticated_user)
+) -> dict[str, Any]:
+    require_owner_or_admin(student_id, identity)
     student = require_student(student_id)
     return {
         "student_id": student_id,
@@ -416,8 +553,29 @@ def build_cross_list_violations(
     return violations
 
 
+def enforce_rate_limit(key: str) -> None:
+    now = time.monotonic()
+    events = rate_limit_events[key]
+    while events and now - events[0] >= RATE_WINDOW_SECONDS:
+        events.popleft()
+    if len(events) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    events.append(now)
+
+
 @app.get("/api/v1/students/{student_id}/audit-report")
-def audit_report(student_id: str, strict: bool = Query(False)) -> dict[str, Any]:
+def audit_report(
+    student_id: str,
+    request: Request,
+    strict: bool = Query(False),
+    identity: dict[str, Any] | None = Depends(optional_authenticated_user),
+) -> dict[str, Any]:
+    limiter_key = (
+        f"sub:{identity['sub']}"
+        if identity is not None
+        else f"ip:{request.client.host if request.client else 'unknown'}"
+    )
+    enforce_rate_limit(limiter_key)
     student = require_student(student_id)
     history = student["history"]
     plan = student["plan"]
@@ -447,4 +605,107 @@ def audit_report(student_id: str, strict: bool = Query(False)) -> dict[str, Any]
             "total_planned": total_planned,
             "total_remaining_for_graduation": total_remaining,
         },
+    }
+
+
+def next_term(term: str) -> str:
+    value = clean_text(term).upper()
+    match = re.fullmatch(r"(\d{2,4})(W|SP|S|F)", value)
+    if not match:
+        return "26F"
+    year_text, season = match.groups()
+    year = int(year_text)
+    order = ["W", "SP", "S", "F"]
+    index = order.index(season)
+    if index == len(order) - 1:
+        year += 1
+        season = "W"
+    else:
+        season = order[index + 1]
+    width = len(year_text)
+    return f"{year:0{width}d}{season}"
+
+
+def latest_history_term(history: list[dict[str, Any]]) -> str:
+    valid = [clean_text(row.get("term")) for row in history if clean_text(row.get("term"))]
+    if not valid:
+        return "26S"
+    return max(valid, key=term_key)
+
+
+def build_recommended_pathway(student: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    completed = set(completed_by_code(student["history"]))
+
+    # A cross-listed equivalent already completed should not be recommended again.
+    completed_equivalents = set(completed)
+    for code in list(completed):
+        course = catalog.get(code)
+        if course:
+            completed_equivalents.update(
+                normalize_code(cross) for cross in extract_codes(course.get("cross_listed"))
+            )
+
+    remaining = {
+        code: course
+        for code, course in catalog.items()
+        if code not in completed_equivalents
+    }
+    indegree = {code: 0 for code in remaining}
+    dependents: dict[str, set[str]] = defaultdict(set)
+    blocked: set[str] = set()
+
+    for code, course in remaining.items():
+        for prereq_text in extract_codes(course.get("prerequisites")):
+            prereq = normalize_code(prereq_text)
+            if prereq in completed_equivalents:
+                continue
+            if prereq not in remaining:
+                blocked.add(code)
+                continue
+            if code not in dependents[prereq]:
+                dependents[prereq].add(code)
+                indegree[code] += 1
+
+    for code in blocked:
+        indegree.pop(code, None)
+    for prereq in list(dependents):
+        dependents[prereq] = {c for c in dependents[prereq] if c not in blocked}
+
+    ready = sorted(code for code, degree in indegree.items() if degree == 0)
+    pathway: list[dict[str, Any]] = []
+    scheduled: set[str] = set()
+    term = next_term(latest_history_term(student["history"]))
+
+    while ready:
+        current_level = ready
+        ready = []
+        pathway.append(
+            {
+                "term": term,
+                "courses": [remaining[code]["course_code"] for code in current_level],
+            }
+        )
+        term = next_term(term)
+        for code in current_level:
+            scheduled.add(code)
+            for dependent in sorted(dependents.get(code, set())):
+                if dependent not in indegree:
+                    continue
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    ready.append(dependent)
+        ready = sorted(set(ready) - scheduled)
+
+    return pathway
+
+
+@app.get("/api/v1/students/{student_id}/recommendations")
+def recommendations(
+    student_id: str, identity: dict[str, Any] = Depends(authenticated_user)
+) -> dict[str, Any]:
+    require_owner_or_admin(student_id, identity)
+    student = require_student(student_id)
+    return {
+        "student_id": student_id,
+        "recommended_pathway": build_recommended_pathway(student),
     }

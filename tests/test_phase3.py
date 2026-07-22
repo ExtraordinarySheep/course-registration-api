@@ -38,8 +38,17 @@ def test_audit_report_warning_and_strict_failed():
         files={"file": ("catalog.html", CATALOG, "text/html")},
     )
     assert r.status_code == 200
+    client.post(
+        "/api/v1/auth/register",
+        json={"username": "770001", "password": "test-pass"},
+    )
+    token = client.post(
+        "/api/v1/auth/login",
+        json={"username": "770001", "password": "test-pass"},
+    ).json()["access_token"]
     r = client.post(
         "/api/v1/students/770001/history/import",
+        headers={"Authorization": f"Bearer {token}"},
         files={"file": ("student.html", TRANSCRIPT, "text/html")},
     )
     assert r.status_code == 201
